@@ -96,6 +96,7 @@ _CSS = """
   padding:2px 10px;border-radius:99px;margin-bottom:8px;font-weight:500}
 .nb-kw.know{color:#0b6fb8;background:rgba(0,140,220,.10)}
 .nb-kw.thin{color:#ff7a29;background:rgba(255,122,41,.12)}
+.nb-kw.live{color:#00c48c;background:rgba(0,196,140,.14);font-weight:600}
 .nb-item{padding:6px 0 6px 14px;border-left:3px solid #e6e6f5;margin-bottom:8px}
 .nb-item a{color:#14142b;text-decoration:none}
 #MainMenu{visibility:hidden}
@@ -133,8 +134,13 @@ def _render_news_card(item: dict, badge_html: str = "",
 def _render_answer(item: dict) -> None:
     """渲染一条问答记录：来源类型徽章 + 回答正文 + 原文链接列表。"""
     source_type = item.get("source_type", "news")
-    if source_type == "knowledge":
-        st.markdown('<span class="nb-kw know">📚 通用知识回答 · 非今日新闻</span>',
+    if source_type == "live_web":
+        st.markdown(
+            f'<span class="nb-kw live">🌐 全网实时搜索 · '
+            f'命中 {item.get("count", 0)} 条 · 极速生成</span>',
+            unsafe_allow_html=True)
+    elif source_type == "knowledge":
+        st.markdown('<span class="nb-kw know">📚 通用知识回答 · 非近期新闻</span>',
                     unsafe_allow_html=True)
     elif source_type == "news_thin":
         st.markdown(
@@ -180,8 +186,8 @@ if "booted" not in st.session_state:
 # 各阶段的中文提示（文案与原前端保持一致）
 _STAGE_TEXT = {
     "collecting": "正在抓取新闻…（11 个数据源并发获取，通常 2-3 秒）",
-    "matching":   "正在筛选…（在今日新闻池中匹配关键词）",
-    "llm":        "模型归纳中…（通常 5-10 秒，请稍候）",
+    "matching":   "正在检索…（匹配今日新闻池与全网实时资讯）",
+    "llm":        "极速模型归纳中…（通常 8-15 秒，请稍候）",
     "writing":    "正在生成页面…（马上就好）",
 }
 
@@ -327,13 +333,13 @@ if tab == TABS[0]:
             unsafe_allow_html=True)
 
 # ==================================================================
-# Tab 2：关键词筛选
+# Tab 2：关键词筛选与全网实时搜索
 # ==================================================================
 elif tab == TABS[1]:
-    st.markdown("#### 🔍 按关键词生成简报")
-    st.caption("从今日新闻池中筛选关键词相关内容，交给模型归纳成简报。")
+    st.markdown("#### 🔍 关键词筛选（支持全网实时搜索）")
+    st.caption("输入任意关键词（人名、公司、行业、热点事件），支持全网实时新闻搜索并极速生成专属简报。")
     kw = st.text_input("关键词", key="filter_kw",
-                       placeholder="例如：芯片 / A股 / 特斯拉 / 固态电池",
+                       placeholder="例如：海底 / 芯片 / A股 / 特斯拉 / 低空经济",
                        label_visibility="collapsed")
     c1, c2 = st.columns(2)
     with c1:

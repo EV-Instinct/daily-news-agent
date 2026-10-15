@@ -25,6 +25,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import feedparser
 import requests
@@ -39,7 +40,7 @@ BRIEFING = DATA / "briefing.json"
 load_dotenv(BASE / ".env")
 # 兼容旧配置：优先读 ZHIPUAI_API_KEY，其次回落到旧的 DASHSCOPE_API_KEY
 API_KEY = (os.getenv("ZHIPUAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
-MODEL = os.getenv("AGENT_MODEL", "glm-4-flash").strip()
+MODEL = os.getenv("AGENT_MODEL", "glm-4-flashx").strip()
 MODEL_QA = os.getenv("AGENT_MODEL_QA", "").strip() or MODEL
 MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "1200"))
 
@@ -434,6 +435,76 @@ def fetch_one(name: str, url: str) -> tuple:
         return name, [], f"{type(ex).__name__}"
 
 
+def fetch_live_web_news(keyword: str, limit: int = 12) -> list[dict]:
+    """全网实时新闻搜索：双引擎容灾（Google News RSS + Bing 网页检索），突破固定源限制。"""
+    items = []
+    seen = set()
+
+    # 引擎 1：Google News RSS（云端部署与主流网络秒级响应，中文源覆盖广）
+    try:
+        url = f"https://news.google.com/rss/search?q={quote(keyword)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+        d = feedparser.parse(url)
+        for e in d.entries[:limit]:
+            t_raw = getattr(e, "title", "").strip()
+            if not t_raw:
+                continue
+            parts = t_raw.rsplit(" - ", 1)
+            title = parts[0].strip()
+            source = parts[1].strip() if len(parts) > 1 else "全网主流媒体"
+            link = getattr(e, "link", "")
+            summary = re.sub(r"<[^>]+>", "", getattr(e, "summary", "")).strip()[:120]
+            if title and title not in seen:
+                seen.add(title)
+                items.append({
+                    "title": title,
+                    "link": link,
+                    "summary": summary,
+                    "source": source,
+                    "category": "全网实时",
+                    "_ts": time.time(),
+                    "time": "最新",
+                })
+    except Exception as ex:
+        print(f"[live_search] Google News err: {ex}")
+
+    # 引擎 2：必应检索兜底（当引擎 1 命中不足时补充）
+    if len(items) < 3:
+        try:
+            b_url = f"https://cn.bing.com/search?q={quote(keyword + ' 最新')}&ensearch=0"
+            r = requests.get(b_url, headers=UA, timeout=5)
+            blocks = re.findall(r'<li class="b_algo"[^>]*>(.*?)</li>', r.text, re.DOTALL)
+            for b in blocks:
+                m_a = re.search(r'<h2>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', b)
+                m_p = re.search(r'<p[^>]*>(.*?)</p>', b)
+                m_cite = re.search(r'<cite[^>]*>(.*?)</cite>', b)
+                if m_a:
+                    link = m_a.group(1)
+                    if not link.startswith("http"):
+                        continue
+                    title = re.sub(r"<[^>]+>", "", m_a.group(2)).strip()
+                    summary = re.sub(r"<[^>]+>", "", m_p.group(1)).strip() if m_p else ""
+                    src = re.sub(r"<[^>]+>", "", m_cite.group(1)).strip() if m_cite else "全网"
+                    src = src.split("/")[0].split("?")[0].replace("https:", "").replace("http:", "").strip() or "全网资讯"
+                    if title and title not in seen:
+                        seen.add(title)
+                        items.append({
+                            "title": title,
+                            "link": link,
+                            "summary": summary[:120],
+                            "source": src[:12],
+                            "category": "全网实时",
+                            "_ts": time.time(),
+                            "time": "最新",
+                        })
+                if len(items) >= limit:
+                    break
+        except Exception as ex:
+            print(f"[live_search] Bing err: {ex}")
+
+    print(f"[live_search] 'keyword={keyword}' 抓取全网最新新闻 {len(items)} 条")
+    return items[:limit]
+
+
 def collect() -> tuple:
     """并发抓取所有源，返回 (新闻列表, 源健康状态)。"""
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
@@ -657,27 +728,41 @@ def answer(question: str, history: list = None) -> dict:
         if strong:
             hits = strong
 
-    # ---- 分级：决定走新闻路还是知识路 ----
+    # ---- 分级：优先本地新闻 -> 其次全网实时搜索 -> 最后通用知识 ----
     if len(hits) >= 3:
         mode, source_type = "news", "news"          # 新闻充足
     elif len(hits) >= 1:
         mode, source_type = "news_thin", "news_thin"  # 少量新闻，照实说明
     else:
-        mode, source_type = "knowledge", "knowledge"  # 完全没有→用模型知识
+        # 本地库无内容：实时全网搜索补充
+        search_query = " ".join([k for k in keywords if k.lower() not in GENERIC][:2]) or question[:20]
+        live_hits = fetch_live_web_news(search_query, limit=6)
+        if live_hits:
+            hits = live_hits
+            mode, source_type = "live_web", "live_web"
+        else:
+            mode, source_type = "knowledge", "knowledge"  # 全网无结果→用模型知识
 
     # ---- 构造上下文 ----
     today = datetime.now().strftime("%Y年%m月%d日")
     if mode == "knowledge":
         ctx = ""
         instruction = (
-            f"【重要】今日新闻库中没有任何与该问题相关的内容。\n"
-            f"这说明你的问题不属于今日新闻范畴（可能是知识问答、学科概念、"
+            f"【重要】全网与今日新闻库中均无与该问题直接相关的报道。\n"
+            f"这说明你的问题可能不属于近期新闻范畴（如知识问答、学科概念、"
             f"历史、生活常识、技术方法等）。\n\n"
             f"请**直接用你自己的知识**回答这个问题，回答开头必须先说明："
-            f"「以下为通用知识回答，非今日新闻」。\n"
+            f"「以下为通用知识回答，非近期新闻报道」。\n"
             f"要求：内容准确、有条理，不少于 150 字；"
-            f"如果是时效性强的信息（如最新版本、最新数据），"
-            f"请注明你的知识可能存在滞后。")
+            f"如果是时效性强的信息，请注明你的知识可能存在滞后。")
+    elif mode == "live_web":
+        ctx = (f"以下是【全网实时检索】到的最新相关报道：\n\n" +
+               "\n".join(
+                   f"[{i}] 最新｜来源：{n['source']}｜标题：{n['title']}\n"
+                   f"     摘要：{n['summary']}"
+                   for i, n in enumerate(hits, 1)) +
+               f"\n\n注意：以上是全网刚刚检索到的最新实时动态。")
+        instruction = "以下是全网实时检索到的最新新闻报道，请基于这些报道客观准确地回答用户问题，每条结论明确标注来源与时间。"
     else:
         note = ("以下是今日新闻的相关报道，请优先基于这些内容回答"
                 if mode == "news" else
@@ -793,8 +878,18 @@ def generate(keyword: str = "") -> dict:
                 blob = (n["title"] + " " + n["summary"]).lower()
                 if any(k in blob for k in kws):
                     hit.append(n)
+            # 若本地池匹配不足 3 条，自动触发全网实时搜索补充，确保任意关键词都能生成！
+            if len(hit) < 3:
+                print(f"[live] 本地池匹配「{keyword}」共 {len(hit)} 条，触发全网实时搜索...")
+                web_hits = fetch_live_web_news(keyword, limit=12)
+                if web_hits:
+                    seen_t = {h["title"] for h in hit}
+                    for wh in web_hits:
+                        if wh["title"] not in seen_t:
+                            hit.append(wh)
+                            seen_t.add(wh["title"])
             if not hit:
-                return _fail(f"今日新闻里没有「{keyword}」相关内容",
+                return _fail(f"全网与今日新闻中均未找到「{keyword}」相关内容",
                              keyword=keyword, elapsed=round(time.time() - t0, 1))
             news = hit
 
