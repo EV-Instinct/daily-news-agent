@@ -1,0 +1,21 @@
+# 敏感配置：含真实 API Key，严禁提交
+.env
+
+# 本地虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 运行时产物
+data/briefing.json
+run.log
+verify_shot.png
+_verify_ui.py
+
+# Streamlit 本地 secrets（云端 Key 在 Web 界面配置）
+.streamlit/secrets.toml
+
+.DS_Store
