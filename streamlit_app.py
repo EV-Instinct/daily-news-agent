@@ -163,55 +163,10 @@ def _render_answer(item: dict) -> None:
 
 
 # ------------------------------------------------------------------
-# 启动引导：今天没有完整简报时，后台跑一次全量生成
-# （Streamlit Cloud 容器重启后 data/ 会被清空，等价于总是重新生成）
+# 启动引导：今天没有完整简报时，才在冷启动跑一次
 # ------------------------------------------------------------------
-def _need_bootstrap() -> bool:
-    """无数据 / 数据不是今天 / 停留在筛选态 → 需要重新生成全量简报。"""
-    if not agent.BRIEFING.exists():
-        return True
-    try:
-        data = json.loads(agent.BRIEFING.read_text(encoding="utf-8"))
-        today = datetime.now().strftime("%Y年%m月%d日")
-        return data.get("date") != today or bool(data.get("keyword"))
-    except Exception:
-        return True
-
-
-if "booted" not in st.session_state:
-    st.session_state.booted = True
-    if _need_bootstrap():
-        threading.Thread(target=agent.generate, daemon=True).start()
-
-# 各阶段的中文提示（文案与原前端保持一致）
-_STAGE_TEXT = {
-    "collecting": "正在并发抓取新闻…（通常 1-2 秒）",
-    "matching":   "正在检索…（全网实时搜索中）",
-    "llm":        "极速模型归纳中…（通常 2-4 秒，请稍候）",
-    "writing":    "正在完成排版…（马上就好）",
-}
-
-
-def _wait_until_done(label: str) -> None:
-    """阻塞轮询直到生成结束：正常完成则 rerun 渲染新数据，失败则展示错误。"""
-    ph = st.empty()
-    while agent._state["running"]:
-        stage = agent._state.get("stage") or "collecting"
-        waited = 0.0
-        if agent._state.get("started_at"):
-            waited = time.time() - agent._state["started_at"]
-        ph.info(f"**{label}**\n\n"
-                f"{_STAGE_TEXT.get(stage, '处理中…')}　·　已等待 {waited:.0f} 秒")
-        time.sleep(1.0)
-    ph.empty()
-    if agent._state.get("stage") == "error":
-        st.error(agent._state.get("error") or "生成失败，请重试")
-        return
-    st.rerun()
-
-
 def _read_briefing():
-    """读取当前简报；文件不存在或损坏时返回 None。"""
+    """读取当前主简报（可能是全量或特定关键词）；文件不存在或损坏时返回 None。"""
     if not agent.BRIEFING.exists():
         return None
     try:
@@ -220,35 +175,121 @@ def _read_briefing():
         return None
 
 
-def _start_generate(keyword: str = "") -> None:
-    """后台触发一次生成，并跳转到简报页等待结果。"""
-    if agent._state["running"]:
+def _read_full_briefing():
+    """读取今日全量大早报备份。"""
+    full_f = agent.DATA / "full_briefing.json"
+    if not full_f.exists():
+        return None
+    try:
+        return json.loads(full_f.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _need_bootstrap() -> bool:
+    """今天尚未生成过全量大早报时才需要冷启动。"""
+    full_b = _read_full_briefing()
+    if not full_b:
+        return True
+    today = datetime.now().strftime("%Y年%m月%d日")
+    return full_b.get("date") != today
+
+
+
+
+def _render_briefing(b: dict) -> None:
+    """统一渲染整份简报：元信息 + 焦点要闻 + 分类速览 + 原文卡片 + 数据源状态。"""
+    if not b:
+        st.info("暂无简报内容，请点击「生成简报」或右上角「🔄 重新生成」。")
         return
-    threading.Thread(target=agent.generate, args=(keyword,), daemon=True).start()
-    st.session_state.pending_jump = True
-    st.rerun()
+
+    kw = b.get("keyword") or ""
+    meta = (
+        f'<div class="nb-meta"><span>{_esc(b.get("date"))}</span>'
+        f'<i class="nb-dot"></i><span>{_esc(b.get("weekday"))}</span>'
+        f'<i class="nb-dot"></i><span>{_esc(b.get("generated_at"))} 更新</span>'
+        f'<i class="nb-dot"></i>'
+        + (f'<span class="nb-live">● 专属专题：{_esc(kw)}</span>' if kw
+           else '<span class="nb-live">● 今日全量早报</span>')
+        + "</div>"
+    )
+    st.markdown(meta, unsafe_allow_html=True)
+
+    if kw:
+        stats_kw = b.get("stats") or {}
+        st.markdown(
+            f'<div class="nb-filter">当前聚焦 <b>{_esc(kw)}</b> 专属简报 · '
+            f'命中 {stats_kw.get("matched", 0)} 条 · '
+            f'{_esc(b.get("topic_summary") or "")}</div>',
+            unsafe_allow_html=True)
+
+    # 今日焦点 / 核心要闻
+    highlights = b.get("highlights") or []
+    if highlights:
+        title_hl = f"**今日焦点**（{len(highlights)} 条）" if not kw else f"**【{_esc(kw)}】核心要闻**（{len(highlights)} 条）"
+        st.markdown(title_hl)
+        for i, x in enumerate(highlights):
+            badge = (f'<span style="display:inline-block;font-size:.68rem;'
+                     f'font-weight:700;letter-spacing:.08em;color:#fff;'
+                     f'background:linear-gradient(135deg,#6c3bf4,#ff3d8b);'
+                     f'padding:2px 10px;border-radius:99px;margin-bottom:8px">'
+                     f'焦点 0{i + 1}</span>')
+            _render_news_card(x, badge_html=badge, card_cls="nb-card nb-hl")
+
+    # 分类速览（双列网格）
+    sections = b.get("sections") or []
+    if sections:
+        total = sum(len(s.get("items") or []) for s in sections)
+        st.markdown(f"**分类速览**（{total} 条）")
+        cols = st.columns(2)
+        for i, s in enumerate(sections):
+            with cols[i % 2]:
+                items = s.get("items") or []
+                st.markdown(
+                    f'<div class="nb-card" style="border-top:4px solid #6c3bf4;'
+                    f'margin-bottom:4px"><h4 style="display:flex;align-items:center;'
+                    f'gap:8px;margin:0">{_esc(s.get("category"))}'
+                    f'<span class="nb-src" style="margin-top:0">{len(items)} 条</span>'
+                    f"</h4></div>",
+                    unsafe_allow_html=True)
+                for it in items:
+                    _render_news_card(it, card_cls="nb-item")
+
+    # 数据源健康状态与耗时
+    stats = b.get("stats") or {}
+    dead = stats.get("dead_sources") or []
+    status = (
+        f'<span class="nb-warn">⚠ {len(dead)} 个数据源失效：{_esc("、".join(dead))}</span>'
+        if dead else
+        f'<span class="nb-ok">● {stats.get("sources_total", 11)} 个数据源全部正常</span>'
+    )
+    st.markdown(
+        f'<div class="nb-meta" style="margin-top:14px">{status}'
+        f'<i class="nb-dot"></i>'
+        f'<span>本次 <b>{stats.get("collected", 0)}</b> 条 · '
+        f'耗时 <b>{stats.get("elapsed", 0)}</b> 秒</span></div>',
+        unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------
 # 页头：标题 + 重新生成按钮
 # ------------------------------------------------------------------
-h_left, h_right = st.columns([5, 1])
+h_left, h_right = st.columns([5, 1.2])
 with h_left:
     st.markdown('<div class="nb-title">每日新闻简报</div>', unsafe_allow_html=True)
 with h_right:
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    if st.button("🔄 重新生成", use_container_width=True,
-                 disabled=agent._state["running"]):
-        _start_generate("")
-
-# 生成结束后自动从筛选/问答页跳回简报页，让用户直接看到结果
-if st.session_state.get("pending_jump") and not agent._state["running"]:
-    st.session_state.pending_jump = False
-    st.session_state.tab = "📰 今日简报"
-    st.rerun()
+    if st.button("🔄 重新生成", use_container_width=True):
+        with st.spinner("正在并发抓取 11 源并并行生成全量早报…"):
+            res = agent.generate("")
+            if not res.get("ok"):
+                st.error(res.get("msg", "生成失败"))
+            else:
+                st.success("早报更新成功！")
+                st.rerun()
 
 # ------------------------------------------------------------------
-# 三个功能区：简报 / 关键词筛选 / 问答（用 radio 实现可记忆的切换）
+# 三个功能区：简报 / 关键词筛选 / 问答（用 radio 切换）
 # ------------------------------------------------------------------
 TABS = ["📰 今日简报", "🔍 关键词筛选", "💬 问问今天"]
 if "tab" not in st.session_state:
@@ -256,108 +297,61 @@ if "tab" not in st.session_state:
 tab = st.radio("功能区", TABS, horizontal=True, key="tab",
                label_visibility="collapsed")
 
-briefing = _read_briefing()
-
 # ==================================================================
-# Tab 1：今日简报
+# Tab 1：今日简报（全量早报大盘）
 # ==================================================================
 if tab == TABS[0]:
-    if agent._state["running"]:
-        _wait_until_done("正在生成今日简报…")
-    elif briefing is None:
-        st.info("尚未生成简报，点右上角「🔄 重新生成」开始。")
-    else:
-        kw = briefing.get("keyword") or ""
-        meta = (
-            f'<div class="nb-meta"><span>{_esc(briefing.get("date"))}</span>'
-            f'<i class="nb-dot"></i><span>{_esc(briefing.get("weekday"))}</span>'
-            f'<i class="nb-dot"></i><span>{_esc(briefing.get("generated_at"))} 更新</span>'
-            f'<i class="nb-dot"></i>'
-            + (f'<span class="nb-live">● 筛选：{_esc(kw)}</span>' if kw
-               else '<span class="nb-live">● 全量</span>')
-            + "</div>"
-        )
-        st.markdown(meta, unsafe_allow_html=True)
-
-        if kw:
-            stats_kw = briefing.get("stats") or {}
-            st.markdown(
-                f'<div class="nb-filter">当前只看 <b>{_esc(kw)}</b> 相关 · '
-                f'命中 {stats_kw.get("matched", 0)} 条</div>',
-                unsafe_allow_html=True)
-
-        # 今日焦点
-        highlights = briefing.get("highlights") or []
-        if highlights:
-            st.markdown(f"**今日焦点**（{len(highlights)} 条）")
-            for i, x in enumerate(highlights):
-                badge = (f'<span style="display:inline-block;font-size:.68rem;'
-                         f'font-weight:700;letter-spacing:.08em;color:#fff;'
-                         f'background:linear-gradient(135deg,#6c3bf4,#ff3d8b);'
-                         f'padding:2px 10px;border-radius:99px;margin-bottom:8px">'
-                         f'焦点 0{i + 1}</span>')
-                _render_news_card(x, badge_html=badge, card_cls="nb-card nb-hl")
-
-        # 分类速览（双列网格）
-        sections = briefing.get("sections") or []
-        if sections:
-            total = sum(len(s.get("items") or []) for s in sections)
-            st.markdown(f"**分类速览**（{total} 条）")
-            cols = st.columns(2)
-            for i, s in enumerate(sections):
-                with cols[i % 2]:
-                    items = s.get("items") or []
-                    st.markdown(
-                        f'<div class="nb-card" style="border-top:4px solid #6c3bf4;'
-                        f'margin-bottom:4px"><h4 style="display:flex;align-items:center;'
-                        f'gap:8px;margin:0">{_esc(s.get("category"))}'
-                        f'<span class="nb-src" style="margin-top:0">{len(items)} 条</span>'
-                        f"</h4></div>",
-                        unsafe_allow_html=True)
-                    for it in items:
-                        _render_news_card(it, card_cls="nb-item")
-
-        # 数据源健康状态
-        stats = briefing.get("stats") or {}
-        dead = stats.get("dead_sources") or []
-        status = (
-            f'<span class="nb-warn">⚠ {len(dead)} 个数据源失效：{_esc("、".join(dead))}</span>'
-            if dead else
-            f'<span class="nb-ok">● {stats.get("sources_total", 11)} 个数据源全部正常</span>'
-        )
-        st.markdown(
-            f'<div class="nb-meta" style="margin-top:14px">{status}'
-            f'<i class="nb-dot"></i>'
-            f'<span>本次 <b>{stats.get("collected", 0)}</b> 条 · '
-            f'耗时 <b>{stats.get("elapsed", 0)}</b> 秒</span></div>',
-            unsafe_allow_html=True)
+    b = _read_full_briefing() or _read_briefing()
+    if not b:
+        with st.spinner("首次打开，正在为您生成今日全量早报…"):
+            res = agent.generate("")
+            b = res.get("payload") or _read_briefing()
+    _render_briefing(b)
 
 # ==================================================================
 # Tab 2：关键词筛选与全网实时搜索
 # ==================================================================
 elif tab == TABS[1]:
-    st.markdown("#### 🔍 关键词筛选（支持全网实时搜索）")
+    st.markdown("#### 🔍 关键词筛选与全网实时搜索")
     st.caption("输入任意关键词（人名、公司、行业、热点事件），支持全网实时新闻搜索并极速生成专属简报。")
-    kw = st.text_input("关键词", key="filter_kw",
-                       placeholder="例如：海底 / 芯片 / A股 / 特斯拉 / 低空经济",
-                       label_visibility="collapsed")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("生成简报", type="primary", use_container_width=True,
-                     disabled=agent._state["running"]):
-            if kw.strip():
-                _start_generate(kw.strip())
-    with c2:
-        if st.button("看全部早报", use_container_width=True,
-                     disabled=agent._state["running"]):
-            _start_generate("")
+    c_in, c_b1, c_b2 = st.columns([4, 1.2, 1.2])
+    with c_in:
+        kw = st.text_input("关键词", key="filter_kw",
+                           placeholder="例如：海洋 / 海底 / 芯片 / A股 / 特斯拉 / 低空经济",
+                           label_visibility="collapsed")
+    with c_b1:
+        btn_gen = st.button("生成简报", type="primary", use_container_width=True)
+    with c_b2:
+        btn_all = st.button("看全部早报", use_container_width=True)
 
-    if agent._state["running"]:
-        _wait_until_done("正在生成简报…")
-    elif briefing:
-        cur = briefing.get("keyword") or "全量"
-        st.caption(f"当前简报：{cur} · {briefing.get('date')} "
-                   f"{briefing.get('generated_at')} 更新（在「今日简报」页查看）")
+    if btn_all:
+        full_b = _read_full_briefing()
+        if full_b:
+            agent.BRIEFING.write_text(json.dumps(full_b, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            with st.spinner("正在生成全量早报…"):
+                agent.generate("")
+        st.session_state.filter_kw = ""
+        st.rerun()
+
+    if btn_gen:
+        if not kw.strip():
+            st.warning("请输入要筛选或搜索的关键词")
+        else:
+            with st.spinner(f"正在全网实时检索「{kw.strip()}」并极速归纳中…"):
+                res = agent.generate(kw.strip())
+                if not res.get("ok"):
+                    st.error(res.get("msg", "生成失败"))
+                else:
+                    st.rerun()
+
+    # 关键修复：就地直接渲染简报！不用跳转，页面直接展开卡片，可顺畅向下滑动！
+    briefing = _read_briefing()
+    if briefing:
+        st.markdown("---")
+        _render_briefing(briefing)
+    else:
+        st.info("暂无简报，请输入关键词后点击「生成简报」。")
 
 # ==================================================================
 # Tab 3：今日新闻问答（支持流式打字机秒级上屏）

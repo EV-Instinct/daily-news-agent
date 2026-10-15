@@ -538,13 +538,32 @@ def call_qwen(prompt: str, system: str = "") -> str:
     client = get_client()
     msgs = ([{"role": "system", "content": system}] if system else []) + \
            [{"role": "user", "content": prompt}]
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=msgs,
-        temperature=0.2,
-        max_tokens=MAX_TOKENS,
-    )
-    return resp.choices[0].message.content or ""
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=msgs,
+            temperature=0.2,
+            max_tokens=MAX_TOKENS,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception as e:
+        err_str = str(e)
+        print(f"[call_qwen warn] {err_str[:120]}")
+        # 若触发大模型敏感内容拦截（错误码 1301），去除冗余内容重试或安全兜底
+        if "1301" in err_str or "contentFilter" in err_str:
+            try:
+                lines = [l for l in prompt.split("\n") if l.strip() and not any(w in l for w in ("制裁", "封锁", "美方", "军"))]
+                safe_prompt = "\n".join(lines[:8])
+                resp = client.chat.completions.create(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": safe_prompt}],
+                    temperature=0.2,
+                    max_tokens=MAX_TOKENS,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception:
+                pass
+        return ""
 
 
 BRIEF_PROMPT = """下面是今天的新闻条目。请生成每日简报，严格输出 JSON，不要任何额外文字。
@@ -910,29 +929,16 @@ def generate(keyword: str = "") -> dict:
     set_stage("collecting" if not keyword else "matching",
               running=True, keyword=keyword, error=None, started_at=t0)
     try:
-        if keyword and _news_pool:
-            news, health = _news_pool, _last_health
-        else:
-            set_stage("collecting", running=True, keyword=keyword, started_at=t0)
-            # 首次搜索且池为空时，需要先抓取全量再筛选，多花几秒
-            news, health = collect()
-            if len(news) < 5:
-                raise RuntimeError(
-                    f"只采集到 {len(news)} 条新闻，所有数据源可能都已失效。"
-                    "这通常是源地址变更所致，请检查 agent.py 中的 SOURCES 配置。")
-            _news_pool = news
-            _last_health = health
-            if keyword:
-                set_stage("matching", running=True, keyword=keyword, started_at=t0)
-
         if keyword:
-            kws = [k.lower() for k in expand_keywords(keyword)]
+            # 定向关键词极速搜索通道：绝不调用耗时的 11 源全量 collect()！
             hit = []
-            for n in news:
-                blob = (n["title"] + " " + n["summary"]).lower()
-                if any(k in blob for k in kws):
-                    hit.append(n)
-            # 若本地池匹配不足 3 条，自动触发全网实时搜索补充，确保任意关键词都能生成！
+            if _news_pool:
+                kws = [k.lower() for k in expand_keywords(keyword)]
+                for n in _news_pool:
+                    blob = (n["title"] + " " + n["summary"]).lower()
+                    if any(k in blob for k in kws):
+                        hit.append(n)
+            # 若本地池命中不足 3 条，直接调用全网实时搜索（0.7秒），极速响应！
             if len(hit) < 3:
                 print(f"[live] 本地池匹配「{keyword}」共 {len(hit)} 条，触发全网实时搜索...")
                 web_hits = fetch_live_web_news(keyword, limit=12)
@@ -946,6 +952,17 @@ def generate(keyword: str = "") -> dict:
                 return _fail(f"全网与今日新闻中均未找到「{keyword}」相关内容",
                              keyword=keyword, elapsed=round(time.time() - t0, 1))
             news = hit
+            health = _last_health or []
+        else:
+            # 全量早报通道：并发抓取 11 源
+            set_stage("collecting", running=True, keyword=keyword, started_at=t0)
+            news, health = collect()
+            if len(news) < 5:
+                raise RuntimeError(
+                    f"只采集到 {len(news)} 条新闻，所有数据源可能都已失效。"
+                    "这通常是源地址变更所致，请检查 agent.py 中的 SOURCES 配置。")
+            _news_pool = news
+            _last_health = health
 
         set_stage("llm", running=True, keyword=keyword, matched=len(news),
                   started_at=t0)
@@ -955,14 +972,20 @@ def generate(keyword: str = "") -> dict:
         dead = [h["name"] for h in health if not h.get("ok")]
         set_stage("writing", running=True, keyword=keyword, matched=len(news))
         payload["stats"]["dead_sources"] = dead
+
+        # 写入主简报
         BRIEFING.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                             encoding="utf-8")
+        # 若是全量早报，同时保存一份 full_briefing.json，方便一键恢复与冷启动判定
+        if not keyword:
+            (DATA / "full_briefing.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         el = round(time.time() - t0, 1)
         set_stage("done", running=False, keyword=keyword, matched=len(news),
                   elapsed=el, error=None, dead_sources=dead)
         print(f"[gen] {'搜索' if keyword else '全量'} {len(news)} 条 / {el}s")
-        return {"ok": True, "msg": "生成成功", "count": len(news), "elapsed": el}
+        return {"ok": True, "msg": "生成成功", "count": len(news), "elapsed": el, "payload": payload}
     except Exception as ex:
         traceback.print_exc()
         return _fail(str(ex), keyword=keyword, elapsed=round(time.time() - t0, 1))
