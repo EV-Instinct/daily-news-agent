@@ -185,10 +185,10 @@ if "booted" not in st.session_state:
 
 # 各阶段的中文提示（文案与原前端保持一致）
 _STAGE_TEXT = {
-    "collecting": "正在抓取新闻…（11 个数据源并发获取，通常 2-3 秒）",
-    "matching":   "正在检索…（匹配今日新闻池与全网实时资讯）",
-    "llm":        "极速模型归纳中…（通常 8-15 秒，请稍候）",
-    "writing":    "正在生成页面…（马上就好）",
+    "collecting": "正在并发抓取新闻…（通常 1-2 秒）",
+    "matching":   "正在检索…（全网实时搜索中）",
+    "llm":        "极速模型归纳中…（通常 2-4 秒，请稍候）",
+    "writing":    "正在完成排版…（马上就好）",
 }
 
 
@@ -360,12 +360,11 @@ elif tab == TABS[1]:
                    f"{briefing.get('generated_at')} 更新（在「今日简报」页查看）")
 
 # ==================================================================
-# Tab 3：今日新闻问答
+# Tab 3：今日新闻问答（支持流式打字机秒级上屏）
 # ==================================================================
 else:
-    st.markdown("#### 💬 今日新闻问答")
-    st.caption("基于今日新闻库作答，每条结论附来源；"
-               "新闻库没有的内容会用通用知识回答，并明确标注「非今日新闻」。支持追问。")
+    st.markdown("#### 💬 今日新闻与全网问答")
+    st.caption("基于今日新闻库及全网实时搜索作答，每条结论附来源；极速流式打字机输出，支持追问。")
 
     for item in st.session_state.get("qa", []):
         with st.chat_message("user"):
@@ -373,7 +372,7 @@ else:
         with st.chat_message("assistant"):
             _render_answer(item)
 
-    question = st.chat_input("问我任何今日新闻问题，例如：宁德时代最近怎么了？")
+    question = st.chat_input("问我任何今日或近期新闻，例如：海底捞最近怎么了？")
     if question:
         if agent._state["running"]:
             st.warning("早报正在生成，请稍后再问")
@@ -383,21 +382,57 @@ else:
             for item in st.session_state.get("qa", [])[-3:]:
                 history.append({"role": "user", "content": item["q"]})
                 history.append({"role": "assistant", "content": item["a"][:600]})
-            with st.spinner("正在查今日新闻…"):
+
+            # 用户气泡
+            with st.chat_message("user"):
+                st.write(question)
+
+            # 助手实时流式输出
+            with st.chat_message("assistant"):
                 try:
                     t0 = time.time()
-                    result = agent.answer(question, history)
-                    result["elapsed"] = round(time.time() - t0, 1)
+                    with st.spinner("正在检索全网最新动态…"):
+                        meta, stream_gen = agent.answer_stream(question, history)
+
+                    # 渲染来源徽章
+                    st_type = meta.get("source_type", "news")
+                    if st_type == "live_web":
+                        st.markdown(
+                            f'<span class="nb-kw live">🌐 全网实时搜索 · '
+                            f'命中 {meta.get("count", 0)} 条</span>',
+                            unsafe_allow_html=True)
+                    elif st_type == "knowledge":
+                        st.markdown('<span class="nb-kw know">📚 通用知识回答 · 非近期新闻</span>',
+                                    unsafe_allow_html=True)
+                    elif st_type == "news_thin":
+                        st.markdown(
+                            f'<span class="nb-kw thin">📰 今日新闻相关较少 · '
+                            f'命中 {meta.get("count", 0)} 条</span>',
+                            unsafe_allow_html=True)
+
+                    # 流式打出答案
+                    full_answer = st.write_stream(stream_gen)
+                    el = round(time.time() - t0, 1)
+
+                    # 渲染原文链接
+                    refs = meta.get("refs") or []
+                    if refs:
+                        st.caption(f"原文链接（耗时 {el}s）")
+                        for r in refs:
+                            st.markdown(
+                                f"- [{_esc(r.get('source'))} {_esc(r.get('time'))}] "
+                                f"[{_esc(r.get('title'))}]({r.get('link', '')})")
+
+                    # 存入历史记录
                     st.session_state.qa = st.session_state.get("qa", []) + [{
                         "q": question,
-                        "a": result.get("answer", ""),
-                        "keywords": result.get("keywords", []),
-                        "refs": result.get("refs", []),
-                        "count": result.get("count", 0),
-                        "source_type": result.get("source_type", "news"),
-                        "elapsed": result.get("elapsed", 0),
+                        "a": full_answer,
+                        "keywords": meta.get("keywords", []),
+                        "refs": meta.get("refs", []),
+                        "count": meta.get("count", 0),
+                        "source_type": meta.get("source_type", "news"),
+                        "elapsed": el,
                     }]
-                    st.rerun()
                 except Exception as ex:
                     st.error(f"问答失败：{ex}")
 
